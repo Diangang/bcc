@@ -72,17 +72,9 @@ static int handle_block_rq_complete(struct request *rq, int error, unsigned int 
 
 	hkey.dev = 0; // Initialize
 	if (targ_per_disk) {
-		struct gendisk *disk = NULL;
-		struct request_queue *q = BPF_CORE_READ(rq, q);
-		if (q)
-			disk = BPF_CORE_READ(q, disk);
-
-		if (disk) {
-			u32 major = BPF_CORE_READ(disk, major);
-			u32 minor = BPF_CORE_READ(disk, first_minor);
-			hkey.dev = MKDEV(major, minor);
-		} else {
-		}
+		struct gendisk *disk = get_disk(rq);
+		hkey.dev = disk ? MKDEV(BPF_CORE_READ(disk, major),
+					     BPF_CORE_READ(disk, first_minor)) : 0;
 	}
 
 	if (filter_dev && hkey.dev != targ_dev) {
@@ -119,7 +111,7 @@ static int handle_block_rq_complete(struct request *rq, int error, unsigned int 
 	return 0;
 }
 
-SEC("tp_btf/block_rq_complete")
+SEC("raw_tracepoint/block_rq_complete")
 int BPF_PROG(block_rq_complete_btf, struct request *rq, int error, unsigned int nr_bytes)
 {
 	return handle_block_rq_complete(rq, error, nr_bytes);

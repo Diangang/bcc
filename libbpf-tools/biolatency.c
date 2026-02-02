@@ -217,7 +217,7 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 	int i, j;
 	long ncpus;
 	int get_next_key_ret; // Store return value
-	size_t hist_size, expected_alloc_size; // Variables for sizes
+	size_t hist_size; // Variables for sizes
 
 	ncpus = libbpf_num_possible_cpus();
 	if (ncpus <= 0) {
@@ -228,9 +228,8 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 
 	// Debug allocation size
 	hist_size = sizeof(struct hist); // Should be ncpus * sizeof(unsigned long long) now
-	expected_alloc_size = ncpus * hist_size;
-	fprintf(stderr, "DEBUG: ncpus=%ld, sizeof(struct hist)=%zu, attempting to allocate %zu bytes for per-CPU data\n",
-			ncpus, hist_size, expected_alloc_size);
+	// fprintf(stderr, "DEBUG: ncpus=%ld, sizeof(struct hist)=%zu, attempting to allocate %zu bytes for per-CPU data\n",
+	// 		ncpus, hist_size, ncpus * hist_size);
 
 	percpu_hists = calloc(ncpus, hist_size); // Allocate based on correct size
 	if (!percpu_hists) {
@@ -238,7 +237,7 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 		return -ENOMEM; // Return error
 	}
 
-	fprintf(stderr, "DEBUG: Checking map fd %d for keys...\n", fd);
+	// fprintf(stderr, "DEBUG: Checking map fd %d for keys...\n", fd);
 
 	// --- Get the very first key ---
 	errno = 0; // Reset errno before the call
@@ -255,9 +254,9 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 	}
 
 	// --- Loop processing the first key and all subsequent keys ---
-	fprintf(stderr, "DEBUG: Starting map processing loop.\n");
+	// fprintf(stderr, "DEBUG: Starting map processing loop.\n");
 	do {
-		fprintf(stderr, "DEBUG: Processing key: dev=%u flags=%d\n", next_key.dev, next_key.cmd_flags);
+		// fprintf(stderr, "DEBUG: Processing key: dev=%u flags=%d\n", next_key.dev, next_key.cmd_flags);
 
 		// --- Lookup, Aggregate, Print ---
 		err = bpf_map_lookup_elem(fd, &next_key, percpu_hists);
@@ -277,7 +276,7 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 			for (j = 0; j < MAX_SLOTS; j++) {
 				 current_key_total_count += total_hist.slots[j];
 			}
-			fprintf(stderr, "DEBUG: Aggregated total count for this key: %llu\n", current_key_total_count);
+			// fprintf(stderr, "DEBUG: Aggregated total count for this key: %llu\n", current_key_total_count);
 
 			// Print if count > 0
 			if (current_key_total_count > 0) {
@@ -337,7 +336,7 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 	if (errno != ENOENT) {
 		 fprintf(stderr, "ERROR: Failed on subsequent get_next_key: errno=%d (%s)\n", errno, strerror(errno));
 	} else {
-		 fprintf(stderr, "DEBUG: End of map iteration (get_next_key -> ENOENT).\n");
+		//  fprintf(stderr, "DEBUG: End of map iteration (get_next_key -> ENOENT).\n");
 	}
 	// --- End Map Processing Loop ---
 
@@ -346,7 +345,7 @@ cleanup_loop:
 	free(percpu_hists);
 
 	// --- Map clearing logic (delete all keys) ---
-	fprintf(stderr, "DEBUG: Starting map cleanup loop.\n");
+	// fprintf(stderr, "DEBUG: Starting map cleanup loop.\n");
 	lookup_key = (struct hist_key){}; // Reset lookup key for delete loop
 	while (bpf_map_get_next_key(fd, &lookup_key, &next_key) == 0) {
 		err = bpf_map_delete_elem(fd, &next_key);
@@ -359,7 +358,7 @@ cleanup_loop:
 	if (errno != ENOENT) {
 		fprintf(stderr, "WARN: Error iterating map for deletion: %s (errno %d)\n", strerror(errno), errno);
 	} else {
-		 fprintf(stderr, "DEBUG: Finished map cleanup loop.\n");
+		//  fprintf(stderr, "DEBUG: Finished map cleanup loop.\n");
 	}
 
 	return 0; // Return success from print_log2_hists

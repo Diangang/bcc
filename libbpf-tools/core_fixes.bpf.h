@@ -243,9 +243,7 @@ static __always_inline bool has_kmem_alloc(void)
  */
 static __always_inline __u64 get_sock_ident(struct sock *sk)
 {
-	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_check_mtu)) {
-		return bpf_get_socket_cookie(sk);
-	}
+	// 5.4 内核兼容：直接返回 sock 指针作为标识符
 	return (__u64)sk;
 }
 
@@ -318,10 +316,8 @@ struct cfs_rq___pre_v614 {
 
 static __always_inline __u8 cfs_rq_get_nr_running_or_nr_queued(void *cfs_rq)
 {
-	if (bpf_core_field_exists(struct cfs_rq___pre_v614, nr_running))
-		return BPF_CORE_READ((struct cfs_rq___pre_v614 *)cfs_rq, nr_running);
-
-	return BPF_CORE_READ((struct cfs_rq *)cfs_rq, nr_queued);
+	// 5.4 内核兼容：使用 nr_running
+	return BPF_CORE_READ((struct cfs_rq___pre_v614 *)cfs_rq, nr_running);
 }
 
 #endif /* __CORE_FIXES_BPF_H */
