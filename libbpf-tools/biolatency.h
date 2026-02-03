@@ -16,7 +16,7 @@ struct hist_key {
 };
 
 struct hist {
-	__u32 slots[MAX_SLOTS];
+	unsigned long long slots[MAX_SLOTS];
 };
 
 #endif /* __BIOLATENCY_H */

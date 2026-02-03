@@ -1,20 +1,30 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 // Copyright (c) 2020 Wenbo Zhang
+// Modified for PERCPU_HASH usage, timestamp selection, and print type fix
 //
 // Based on biolatency(8) from BCC by Brendan Gregg.
 // 15-Jun-2020   Wenbo Zhang   Created this.
+// 02-Apr-2025   Tanel Poder   Changes below:
+//   Rely on built-in [io_]start_time_ns fields in Linux kernel
+//   Remove IO insert/issue TPs and starts map
+//   Mark "hists" map as per-CPU map
+
 #include <argp.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h> // Needed for malloc/free/calloc
+#include <string.h> // Needed for strerror/memset
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <errno.h>  // Needed for errno
+#include <limits.h> // Needed for UINT_MAX check
 #include <bpf/libbpf.h>
 #include <sys/resource.h>
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include "blk_types.h"
-#include "biolatency.h"
+#include "biolatency.h" // Contains struct hist definition (must use unsigned long long)
 #include "biolatency.skel.h"
 #include "trace_helpers.h"
 
@@ -39,11 +49,12 @@ static struct env {
 
 static volatile bool exiting;
 
-const char *argp_program_version = "biolatency 0.1";
+// Command line argument parsing setup (argp)
+const char *argp_program_version = "biolatency 0.4"; // Version bump
 const char *argp_program_bug_address =
 	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
 const char argp_program_doc[] =
-"Summarize block device I/O latency as a histogram.\n"
+"Summarize block device I/O latency as a histogram (uses PERCPU_HASH).\n"
 "\n"
 "USAGE: biolatency [--help] [-T] [-m] [-Q] [-D] [-F] [-d DISK] [-c CG] [interval] [count]\n"
 "\n"
@@ -111,14 +122,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		if (pos_args == 0) {
 			env.interval = strtol(arg, NULL, 10);
-			if (errno) {
-				fprintf(stderr, "invalid internal\n");
+			if (errno || env.interval <= 0) { // Basic validation
+				fprintf(stderr, "Invalid interval: %s\n", arg);
 				argp_usage(state);
 			}
 		} else if (pos_args == 1) {
 			env.times = strtol(arg, NULL, 10);
-			if (errno) {
-				fprintf(stderr, "invalid times\n");
+			if (errno || env.times <= 0) { // Basic validation
+				fprintf(stderr, "Invalid times: %s\n", arg);
 				argp_usage(state);
 			}
 		} else {
@@ -179,92 +190,179 @@ static void print_cmd_flags(int cmd_flags)
 		[REQ_OP_DRV_IN] = "DrvIn",
 		[REQ_OP_DRV_OUT] = "DrvOut",
 	};
-	int i;
+	size_t i;
 
 	printf("flags = ");
-
 	for (i = 0; i < ARRAY_SIZE(flags); i++) {
 		if (cmd_flags & flags[i].bit)
 			printf("%s", flags[i].str);
 	}
-
-	if ((cmd_flags & REQ_OP_MASK) < ARRAY_SIZE(ops))
+	// Check array bounds before accessing ops
+	if ((cmd_flags & REQ_OP_MASK) < ARRAY_SIZE(ops) && ops[cmd_flags & REQ_OP_MASK])
 		printf("%s", ops[cmd_flags & REQ_OP_MASK]);
 	else
-		printf("Unknown");
+		printf("Unknown(%d)", cmd_flags & REQ_OP_MASK);
 }
 
+// Function to read map, aggregate per-CPU values, and print histograms
 static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions)
 {
-	struct hist_key lookup_key = { .cmd_flags = -1 }, next_key;
+	// lookup_key is used to find the *next* element after a given key
+	// next_key stores the key found by get_next_key
+	struct hist_key lookup_key = {}, next_key;
 	const char *units = env.milliseconds ? "msecs" : "usecs";
-	const struct partition *partition;
 	int err, fd = bpf_map__fd(hists);
-	struct hist hist;
+	struct hist *percpu_hists = NULL; // Buffer for per-CPU raw data (unsigned long long)
+	struct hist total_hist;           // Aggregated data (unsigned long long)
+	int i, j;
+	long ncpus;
+	int get_next_key_ret; // Store return value
+	size_t hist_size, expected_alloc_size; // Variables for sizes
 
-	while (!bpf_map_get_next_key(fd, &lookup_key, &next_key)) {
-		err = bpf_map_lookup_elem(fd, &next_key, &hist);
-		if (err < 0) {
-			fprintf(stderr, "failed to lookup hist: %d\n", err);
-			return -1;
-		}
-		if (env.per_disk) {
-			partition = partitions__get_by_dev(partitions,
-							next_key.dev);
-			printf("\ndisk = %s\t", partition ? partition->name :
-				"Unknown");
-		}
-		if (env.per_flag)
-			print_cmd_flags(next_key.cmd_flags);
-		printf("\n");
-		print_log2_hist(hist.slots, MAX_SLOTS, units);
-		lookup_key = next_key;
+	ncpus = libbpf_num_possible_cpus();
+	if (ncpus <= 0) {
+		fprintf(stderr, "ERROR: Failed to determine number of possible CPUs: %s\n",
+			ncpus == 0 ? "Not available" : strerror(-ncpus));
+		return -1; // Return error
 	}
 
-	lookup_key.cmd_flags = -1;
-	while (!bpf_map_get_next_key(fd, &lookup_key, &next_key)) {
+	// Debug allocation size
+	hist_size = sizeof(struct hist); // Should be ncpus * sizeof(unsigned long long) now
+	expected_alloc_size = ncpus * hist_size;
+	fprintf(stderr, "DEBUG: ncpus=%ld, sizeof(struct hist)=%zu, attempting to allocate %zu bytes for per-CPU data\n",
+			ncpus, hist_size, expected_alloc_size);
+
+	percpu_hists = calloc(ncpus, hist_size); // Allocate based on correct size
+	if (!percpu_hists) {
+		fprintf(stderr, "ERROR: Failed to allocate memory for per-CPU histograms (%ld CPUs)\n", ncpus);
+		return -ENOMEM; // Return error
+	}
+
+	fprintf(stderr, "DEBUG: Checking map fd %d for keys...\n", fd);
+
+	// --- Get the very first key ---
+	errno = 0; // Reset errno before the call
+	get_next_key_ret = bpf_map_get_next_key(fd, NULL, &next_key);
+
+	if (get_next_key_ret < 0) {
+		if (errno == ENOENT) {
+			 fprintf(stderr, "DEBUG: Map is empty (first get_next_key -> ENOENT).\n");
+		} else {
+			 fprintf(stderr, "ERROR: Failed on first get_next_key: ret=%d, errno=%d (%s)\n",
+					 get_next_key_ret, errno, strerror(errno));
+		}
+		goto cleanup_loop; // Use goto to ensure percpu_hists is freed
+	}
+
+	// --- Loop processing the first key and all subsequent keys ---
+	fprintf(stderr, "DEBUG: Starting map processing loop.\n");
+	do {
+		fprintf(stderr, "DEBUG: Processing key: dev=%u flags=%d\n", next_key.dev, next_key.cmd_flags);
+
+		// --- Lookup, Aggregate, Print ---
+		err = bpf_map_lookup_elem(fd, &next_key, percpu_hists);
+		if (err < 0) {
+			fprintf(stderr, "ERROR: Failed lookup for key (dev=%u flags=%d): %s\n",
+				next_key.dev, next_key.cmd_flags, strerror(-err));
+		} else {
+			// Aggregate into total_hist (unsigned long long)
+			memset(&total_hist, 0, sizeof(total_hist));
+			unsigned long long current_key_total_count = 0;
+			for (i = 0; i < ncpus; i++) {
+				for (j = 0; j < MAX_SLOTS; j++) {
+					total_hist.slots[j] += percpu_hists[i].slots[j];
+				}
+			}
+			// Sum total count for checks/debug
+			for (j = 0; j < MAX_SLOTS; j++) {
+				 current_key_total_count += total_hist.slots[j];
+			}
+			fprintf(stderr, "DEBUG: Aggregated total count for this key: %llu\n", current_key_total_count);
+
+			// Print if count > 0
+			if (current_key_total_count > 0) {
+				 const struct partition *partition = NULL;
+				 bool printed_header = false;
+
+				 // Print headers
+				 if (env.per_disk) {
+					 partition = partitions__get_by_dev(partitions, next_key.dev);
+					 printf("\ndisk = %s\t", partition ? partition->name : "Unknown");
+					 printed_header = true;
+				 }
+				 if (env.per_flag) {
+					 if (printed_header) printf("\t");
+					 print_cmd_flags(next_key.cmd_flags);
+					 printed_header = true;
+				 }
+				 if (printed_header)
+					 printf("\n");
+
+				 // *** FIX: Create temporary array for print_log2_hist ***
+				 unsigned int temp_slots[MAX_SLOTS];
+				 bool truncated = false;
+				 for (j = 0; j < MAX_SLOTS; j++) {
+					 if (total_hist.slots[j] > UINT_MAX) {
+						 temp_slots[j] = UINT_MAX;
+						 truncated = true;
+					 } else {
+						 temp_slots[j] = (unsigned int)total_hist.slots[j];
+					 }
+				 }
+				 if (truncated && env.verbose) { // Only print truncation warning if verbose
+					 fprintf(stderr, "WARN: Histogram counts truncated for printing for key (dev=%u flags=%d).\n",
+							 next_key.dev, next_key.cmd_flags);
+				 }
+
+				 // Call print_log2_hist with the temporary unsigned int array
+				 print_log2_hist(temp_slots, MAX_SLOTS, units);
+				 // *** END FIX ***
+
+			} else {
+				 fprintf(stderr, "DEBUG: Skipping print for key (dev=%u flags=%d) as total count is zero.\n", next_key.dev, next_key.cmd_flags);
+			}
+		}
+		// --- End Lookup, Aggregate, Print ---
+
+		// Prepare for the next iteration
+		lookup_key = next_key;
+		errno = 0;
+
+		// Try to get the *next* key
+		get_next_key_ret = bpf_map_get_next_key(fd, &lookup_key, &next_key);
+
+	} while (get_next_key_ret == 0); // Continue while get_next_key succeeds
+
+	// Check why the loop finished
+	if (errno != ENOENT) {
+		 fprintf(stderr, "ERROR: Failed on subsequent get_next_key: errno=%d (%s)\n", errno, strerror(errno));
+	} else {
+		 fprintf(stderr, "DEBUG: End of map iteration (get_next_key -> ENOENT).\n");
+	}
+	// --- End Map Processing Loop ---
+
+cleanup_loop:
+	// Cleanup allocated buffer
+	free(percpu_hists);
+
+	// --- Map clearing logic (delete all keys) ---
+	fprintf(stderr, "DEBUG: Starting map cleanup loop.\n");
+	lookup_key = (struct hist_key){}; // Reset lookup key for delete loop
+	while (bpf_map_get_next_key(fd, &lookup_key, &next_key) == 0) {
 		err = bpf_map_delete_elem(fd, &next_key);
-		if (err < 0) {
-			fprintf(stderr, "failed to cleanup hist : %d\n", err);
-			return -1;
+		if (err < 0 && errno != ENOENT) {
+		   fprintf(stderr, "WARN: Failed to delete key (dev=%u flags=%d): %s (errno %d)\n",
+			   next_key.dev, next_key.cmd_flags, strerror(-err), errno);
 		}
 		lookup_key = next_key;
 	}
+	if (errno != ENOENT) {
+		fprintf(stderr, "WARN: Error iterating map for deletion: %s (errno %d)\n", strerror(errno), errno);
+	} else {
+		 fprintf(stderr, "DEBUG: Finished map cleanup loop.\n");
+	}
 
-	return 0;
-}
-
-/*
- * BTF has a func proto for each tracepoint, let's check it like
- *   typedef void (*btf_trace_block_rq_issue)(void *, struct request *);
- *
- * Actually it's a typedef for a pointer to the func proto.
- */
-static bool has_block_rq_issue_single_arg(void)
-{
-	const struct btf *btf = btf__load_vmlinux_btf();
-	const struct btf_type *t1, *t2, *t3;
-	__u32 type_id;
-	bool ret = true;  // assuming recent kernels
-
-	type_id = btf__find_by_name_kind(btf, "btf_trace_block_rq_issue",
-					 BTF_KIND_TYPEDEF);
-	if ((__s32)type_id < 0)
-		return ret;
-
-	t1 = btf__type_by_id(btf, type_id);
-	if (t1 == NULL)
-		return ret;
-
-	t2 = btf__type_by_id(btf, t1->type);
-	if (t2 == NULL || !btf_is_ptr(t2))
-		return ret;
-
-	t3 = btf__type_by_id(btf, t2->type);
-	if (t3 && btf_is_func_proto(t3))
-		ret = (btf_vlen(t3) == 2); // ctx + arg
-
-	return ret;
+	return 0; // Return success from print_log2_hists
 }
 
 int main(int argc, char **argv)
@@ -276,9 +374,11 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct biolatency_bpf *obj;
+	struct biolatency_bpf *obj = NULL; // Initialize object pointer
+	struct tm *tm;
 	char ts[32];
-	int err;
+	time_t t;
+	int err = 0; // Initialize error status
 	int idx, cg_map_fd;
 	int cgfd = -1;
 
@@ -297,6 +397,7 @@ int main(int argc, char **argv)
 	partitions = partitions__load();
 	if (!partitions) {
 		fprintf(stderr, "failed to load partitions info\n");
+		err = -1;
 		goto cleanup;
 	}
 
@@ -304,7 +405,8 @@ int main(int argc, char **argv)
 	if (env.disk) {
 		partition = partitions__get_by_name(partitions, env.disk);
 		if (!partition) {
-			fprintf(stderr, "invaild partition name: not exist\n");
+			fprintf(stderr, "ERROR: Invalid partition name: %s\n", env.disk);
+			err = -1;
 			goto cleanup;
 		}
 		obj->rodata->filter_dev = true;
@@ -315,75 +417,78 @@ int main(int argc, char **argv)
 	obj->rodata->targ_ms = env.milliseconds;
 	obj->rodata->targ_queued = env.queued;
 	obj->rodata->filter_cg = env.cg;
-	obj->rodata->targ_single = has_block_rq_issue_single_arg();
 
-	if (probe_tp_btf("block_rq_insert")) {
-		bpf_program__set_autoload(obj->progs.block_rq_insert, false);
-		bpf_program__set_autoload(obj->progs.block_rq_issue, false);
-		bpf_program__set_autoload(obj->progs.block_rq_complete, false);
-		if (!env.queued)
-			bpf_program__set_autoload(obj->progs.block_rq_insert_btf, false);
-	} else {
-		bpf_program__set_autoload(obj->progs.block_rq_insert_btf, false);
-		bpf_program__set_autoload(obj->progs.block_rq_issue_btf, false);
-		bpf_program__set_autoload(obj->progs.block_rq_complete_btf, false);
-		if (!env.queued)
-			bpf_program__set_autoload(obj->progs.block_rq_insert, false);
-	}
+	// Set autoload options (ensure correct program is loaded)
+	bpf_program__set_autoload(obj->progs.block_rq_complete_btf, true);
 
+	// Load BPF program into kernel
 	err = biolatency_bpf__load(obj);
 	if (err) {
-		fprintf(stderr, "failed to load BPF object: %d\n", err);
+		fprintf(stderr, "ERROR: Failed to load BPF object: %d (%s)\n", err, strerror(-err));
 		goto cleanup;
 	}
 
-	/* update cgroup path fd to map */
+	/* Update cgroup map if -c flag used */
 	if (env.cg) {
 		idx = 0;
 		cg_map_fd = bpf_map__fd(obj->maps.cgroup_map);
-		cgfd = open(env.cgroupspath, O_RDONLY);
-		if (cgfd < 0) {
-			fprintf(stderr, "Failed opening Cgroup path: %s", env.cgroupspath);
+		if (cg_map_fd < 0) {
+			fprintf(stderr, "ERROR: Failed to get cgroup_map fd: %s\n", strerror(errno));
+			err = -1;
 			goto cleanup;
 		}
-		if (bpf_map_update_elem(cg_map_fd, &idx, &cgfd, BPF_ANY)) {
-			fprintf(stderr, "Failed adding target cgroup to map");
+		cgfd = open(env.cgroupspath, O_RDONLY);
+		if (cgfd < 0) {
+			fprintf(stderr, "ERROR: Failed opening Cgroup path %s: %s\n", env.cgroupspath, strerror(errno));
+			err = -errno;
+			goto cleanup;
+		}
+		err = bpf_map_update_elem(cg_map_fd, &idx, &cgfd, BPF_ANY);
+		if (err) {
+			err = -err;
+			fprintf(stderr, "ERROR: Failed adding target cgroup to map: %s\n", strerror(-err));
 			goto cleanup;
 		}
 	}
 
 	err = biolatency_bpf__attach(obj);
 	if (err) {
-		fprintf(stderr, "failed to attach BPF object: %d\n", err);
+		fprintf(stderr, "ERROR: Failed to attach BPF programs: %d (%s)\n", err, strerror(-err));
 		goto cleanup;
 	}
 
+	// Setup signal handling
 	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
 
 	printf("Tracing block device I/O... Hit Ctrl-C to end.\n");
 
-	/* main: poll */
-	while (1) {
+	/* Main loop */
+	while (!exiting && env.times-- > 0) {
 		sleep(env.interval);
 		printf("\n");
 
 		if (env.timestamp) {
-			str_timestamp("%H:%M:%S", ts, sizeof(ts));
+			time(&t);
+			tm = localtime(&t);
+			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
 			printf("%-8s\n", ts);
 		}
 
 		err = print_log2_hists(obj->maps.hists, partitions);
-		if (err)
+		if (err) {
+			fprintf(stderr, "WARN: Error printing histograms, exiting.\n");
 			break;
+		}
 
-		if (exiting || --env.times == 0)
+		if (exiting) // Check again after printing
 			break;
 	}
 
 cleanup:
 	biolatency_bpf__destroy(obj);
 	partitions__free(partitions);
-	if (cgfd > 0)
+	if (cgfd >= 0)
 		close(cgfd);
 
 	return err != 0;
